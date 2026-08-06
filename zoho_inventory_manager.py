@@ -132,7 +132,7 @@ _defaults: dict = {
     "lbl_order_df":    None,  # label tab: loaded order DataFrame
     "lbl_oid_list":    [],    # label tab: salesorder_id per row (parallel to lbl_order_df)
     "lbl_fetch_dates": (date.today(), date.today()),
-    "api_calls":       0,
+    "api_call_times":  [],  # sliding window: list of timestamps (float) for last 60s
     "token":           None,
     "token_expiry":    0.0,
 }
@@ -241,16 +241,20 @@ def _raise_if_auth_error(resp_json: dict, context: str = ""):
 
 def _tick():
     """Track one API call and enforce rate-limit delay."""
-    st.session_state["api_calls"] += 1
+    st.session_state["api_call_times"].append(time.time())
     time.sleep(RATE_DELAY)
 
 
 def _call_guard():
-    """Raise if we're approaching the per-minute API limit."""
-    if st.session_state["api_calls"] >= CALL_HARD_STOP:
+    """Block if >= CALL_HARD_STOP calls were made in the last 60 seconds (sliding window)."""
+    now    = time.time()
+    recent = [t for t in st.session_state["api_call_times"] if now - t < 60]
+    st.session_state["api_call_times"] = recent          # prune expired entries
+    if len(recent) >= CALL_HARD_STOP:
+        wait_s = max(1, int(60 - (now - min(recent))) + 1)
         raise RuntimeError(
-            f"API call count reached {CALL_HARD_STOP}. "
-            "Reset the counter in the sidebar before continuing."
+            f"Rate limit: {len(recent)} calls in the last 60 s (max {CALL_HARD_STOP}). "
+            f"Wait ~{wait_s}s and try again, or click Reset in the sidebar."
         )
 
 
@@ -585,14 +589,17 @@ def _sidebar() -> tuple:
     # ── Dry Run toggle ──
     dry_run = st.sidebar.toggle("🔬 Dry Run (simulate, no writes)", value=False)
 
-    # ── API call counter ──
-    n = st.session_state["api_calls"]
+    # ── API call counter (sliding 60-second window) ──
+    _now    = time.time()
+    _recent = [t for t in st.session_state["api_call_times"] if _now - t < 60]
+    st.session_state["api_call_times"] = _recent
+    n = len(_recent)
     color = "green" if n < CALL_WARN else ("orange" if n < CALL_HARD_STOP else "red")
-    st.sidebar.markdown(f"**API calls this session:** :{color}[{n} / {CALL_HARD_STOP}]")
+    st.sidebar.markdown(f"**API calls (last 60 s):** :{color}[{n} / {CALL_HARD_STOP}]")
     if n >= CALL_WARN:
-        st.sidebar.warning("Approaching rate limit. Writes will stop at 90 calls.")
+        st.sidebar.warning(f"Approaching rate limit — {CALL_HARD_STOP - n} calls remaining this window.")
     if st.sidebar.button("🔄 Reset call counter"):
-        st.session_state["api_calls"] = 0
+        st.session_state["api_call_times"] = []
         st.rerun()
 
     st.sidebar.divider()
