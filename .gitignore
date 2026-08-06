@@ -1,0 +1,13 @@
+# Zoho credentials — never commit this
+zoho_config.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Push logs (local only)
+push_log_*.csv
+
+# Streamlit local secrets
+.streamlit/secrets.toml
