@@ -32,6 +32,7 @@ import random
 from datetime import datetime, date, timedelta
 from io import BytesIO
 
+import base64
 import requests
 import pandas as pd
 import streamlit as st
@@ -39,6 +40,8 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.graphics.barcode import code128 as bc_code128
+from reportlab.pdfbase.pdfmetrics import stringWidth as bc_stringWidth
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -686,6 +689,549 @@ def _resolve_composite_id(token: str, comp_name: str) -> str | None:
         st.session_state["item_id_map"][cache_key] = cid
     return cid
 
+
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 5 — BARCODE GENERATOR
+# Self-contained: no Zoho auth needed. Upload any CSV, map columns, print labels.
+# ════════════════════════════════════════════════════════════════════════════════
+
+_BC_OVERRIDES_FILE     = "bc_label_overrides.json"
+_BC_PRESETS_FILE       = "bc_layout_presets.json"
+_BC_Y_RANGE            = (-5.0, 5.0)
+_BC_DEFAULT_THRESHOLD  = 28
+_BC_SHORT_PRESET = {
+    "item_name_size": 9.0, "price_size": 8.5, "barcode_text_size": 7.5,
+    "bar_width": 0.25, "bar_height": 7.0,
+    "item_name_y": 1.0, "price_y": 1.5, "barcode_y": 2.75,
+    "barcode_text_y": 1.75, "company_y": 1.25,
+}
+_BC_LONG_PRESET = {
+    "item_name_size": 9.0, "price_size": 8.0, "barcode_text_size": 7.5,
+    "bar_width": 0.27, "bar_height": 7.0,
+    "item_name_y": 1.0, "price_y": 0.5, "barcode_y": 2.75,
+    "barcode_text_y": 1.75, "company_y": 1.25,
+}
+_BC_MAPPING_FIELDS = [
+    ("item_name",          "Item Name",       "Unknown Item", "text"),
+    ("rate",               "Price / Rate",    "0",            "text"),
+    ("unit",               "Unit",            "pcs",          "text"),
+    ("sku",                "Barcode / SKU",   "",             "text"),
+    ("quantity_purchased", "Print Count",     "1",            "number"),
+]
+_BC_COL_ALIASES = {
+    "item_name":          ["item_name", "name", "product", "product_name", "description", "item"],
+    "rate":               ["rate", "price", "mrp", "selling_price", "amount", "cost"],
+    "unit":               ["unit", "uom", "unit_of_measure", "measure"],
+    "sku":                ["sku", "barcode", "code", "product_code", "item_code", "upc", "ean"],
+    "quantity_purchased": ["quantity_purchased", "qty", "quantity", "count", "print_count", "units"],
+}
+
+
+def _bc_load_overrides():
+    if os.path.exists(_BC_OVERRIDES_FILE):
+        try:
+            return json.load(open(_BC_OVERRIDES_FILE))
+        except Exception:
+            pass
+    return {}
+
+
+def _bc_save_overrides(ov):
+    try:
+        json.dump(ov, open(_BC_OVERRIDES_FILE, "w"), indent=2)
+    except Exception as e:
+        st.warning(f"Could not save barcode overrides: {e}")
+
+
+def _bc_load_presets():
+    if os.path.exists(_BC_PRESETS_FILE):
+        try:
+            d = json.load(open(_BC_PRESETS_FILE))
+            if "threshold" in d and "short" in d and "long" in d:
+                return d
+        except Exception:
+            pass
+    return {"threshold": _BC_DEFAULT_THRESHOLD,
+            "short": dict(_BC_SHORT_PRESET),
+            "long":  dict(_BC_LONG_PRESET)}
+
+
+def _bc_save_presets(p):
+    try:
+        json.dump(p, open(_BC_PRESETS_FILE, "w"), indent=2)
+    except Exception as e:
+        st.warning(f"Could not save layout presets: {e}")
+
+
+def _bc_fit_font(text, font, max_w, floor_s, ceil_s, step=0.5):
+    s = ceil_s
+    while s >= floor_s:
+        if bc_stringWidth(text, font, s) <= max_w:
+            return s
+        s -= step
+    return floor_s
+
+
+def _bc_auto_defaults(item_name):
+    p = st.session_state["bc_presets"]
+    bucket = "short" if len(str(item_name)) <= p["threshold"] else "long"
+    return dict(p[bucket])
+
+
+def _bc_resolve_size(text, font, max_w, preferred, floor_s):
+    if bc_stringWidth(text, font, preferred) <= max_w:
+        return preferred
+    return _bc_fit_font(text, font, max_w, floor_s, preferred)
+
+
+def _bc_draw_item_name(c, name, pw, mw, font, floor_s, ceil_s,
+                       forced=None, y_off=0.0):
+    base_s = (19.5 + y_off) * mm
+    base_1 = (20.5 + y_off) * mm
+    base_2 = (17.5 + y_off) * mm
+
+    if forced is not None:
+        if bc_stringWidth(name, font, forced) <= mw:
+            c.setFont(font, forced)
+            c.drawCentredString(pw / 2.0, base_s, name)
+            return
+        wrap = forced
+    else:
+        best = _bc_fit_font(name, font, mw, floor_s, ceil_s)
+        if best > floor_s and bc_stringWidth(name, font, best) <= mw:
+            c.setFont(font, best); c.drawCentredString(pw / 2.0, base_s, name); return
+        elif bc_stringWidth(name, font, floor_s) <= mw:
+            c.setFont(font, floor_s); c.drawCentredString(pw / 2.0, base_s, name); return
+        wrap = floor_s
+
+    words, line1_w, split_i = name.split(), [], len(name.split())
+    for i, w in enumerate(words):
+        cand = " ".join(line1_w + [w])
+        if bc_stringWidth(cand, font, wrap) <= mw:
+            line1_w.append(w)
+        else:
+            split_i = i; break
+    else:
+        split_i = len(words)
+
+    line2_w = []
+    for w in words[split_i:]:
+        cand = " ".join(line2_w + [w])
+        if bc_stringWidth(cand, font, wrap) <= mw:
+            line2_w.append(w)
+        else:
+            line2_w.append(".."); break
+
+    c.setFont(font, wrap)
+    c.drawCentredString(pw / 2.0, base_1, " ".join(line1_w))
+    c.drawCentredString(pw / 2.0, base_2, " ".join(line2_w))
+
+
+def _bc_generate_pdf(data, single_preview=False, overrides=None, live_override=None):
+    overrides = overrides or {}
+    buf = BytesIO()
+    pw, ph = 38 * mm, 25 * mm
+    c = rl_canvas.Canvas(buf, pagesize=(pw, ph))
+
+    for _, row in data.iterrows():
+        count   = 1 if single_preview else int(row["Print Count"])
+        bkey    = str(row["Barcode Number"]).strip()
+        iname   = str(row["Item Name"])
+        if single_preview and live_override is not None:
+            sett = live_override
+        else:
+            sett = overrides.get(bkey) or _bc_auto_defaults(iname)
+
+        for _ in range(count):
+            font, mw = "Helvetica", pw - 2 * mm
+            _bc_draw_item_name(c, iname, pw, mw, font, 7.5, 11.0,
+                               forced=sett["item_name_size"],
+                               y_off=sett.get("item_name_y", 0.0))
+
+            price_str  = str(row["Price"])
+            price_size = _bc_resolve_size(price_str, font, mw, sett["price_size"], 6.0)
+            c.setFont(font, price_size)
+            c.drawCentredString(pw / 2.0, (15.0 + sett.get("price_y", 0.0)) * mm, price_str)
+
+            bstr = bkey if (bkey and bkey.lower() != "nan") else "000000"
+            bar  = bc_code128.Code128(bstr,
+                                      barHeight=sett["bar_height"] * mm,
+                                      barWidth=sett["bar_width"] * mm)
+            bar.drawOn(c, (pw - bar.width) / 2.0, (4.8 + sett.get("barcode_y", 0.0)) * mm)
+
+            bt_size = _bc_resolve_size(bstr, font, mw, sett["barcode_text_size"], 5.5)
+            c.setFont(font, bt_size)
+            c.drawCentredString(pw / 2.0, (3.0 + sett.get("barcode_text_y", 0.0)) * mm, bstr)
+
+            co_size = _bc_fit_font("Maharani Shrungar", font, mw, 5.0, 7.5)
+            c.setFont(font, co_size)
+            c.drawCentredString(pw / 2.0, (1.0 + sett.get("company_y", 0.0)) * mm, "Maharani Shrungar")
+            c.showPage()
+
+    c.save(); buf.seek(0); return buf
+
+
+def _bc_show_pdf_preview(buf):
+    b64 = base64.b64encode(buf.read()).decode()
+    st.markdown(
+        f'''<iframe src="data:application/pdf;base64,{b64}#toolbar=0&navpanes=0&scrollbar=0&view=Fit"
+        width="100%" height="150" type="application/pdf"
+        style="border:1px solid #ccc;border-radius:5px;"></iframe>''',
+        unsafe_allow_html=True,
+    )
+
+
+def _bc_apply_mapping(raw_df, mapping):
+    def gcol(fk):
+        m = mapping[fk]
+        if m["col"] and m["col"] in raw_df.columns:
+            return raw_df[m["col"]].astype(str)
+        return pd.Series([m["default"]] * len(raw_df))
+
+    iname = gcol("item_name").fillna("Unknown")
+    rate  = gcol("rate").fillna("0")
+    unit  = gcol("unit").fillna("pcs")
+    sku   = gcol("sku").fillna("").str.replace(r"\.0$", "", regex=True)
+
+    qm = mapping["quantity_purchased"]
+    if qm["col"] and qm["col"] in raw_df.columns:
+        try:
+            pcount = raw_df[qm["col"]].fillna(1).astype(float).astype(int)
+        except Exception:
+            pcount = pd.Series([1] * len(raw_df))
+    else:
+        try:
+            pcount = pd.Series([int(float(qm["default"]))] * len(raw_df))
+        except Exception:
+            pcount = pd.Series([1] * len(raw_df))
+
+    return pd.DataFrame({
+        "Select":         False,
+        "Preview":        False,
+        "Item Name":      iname.values,
+        "Price":          ("Rs." + rate + " / " + unit).values,
+        "Barcode Number": sku.values,
+        "Print Count":    pcount.values,
+    })
+
+
+def _bc_auto_detect(field_key, csv_cols):
+    for alias in _BC_COL_ALIASES.get(field_key, []):
+        for col in csv_cols:
+            if col.strip().lower() == alias:
+                return col
+    return None
+
+
+@st.dialog("🎛️ Customize Barcode Label", width="large")
+def _bc_customize_dialog(row):
+    bkey  = str(row["Barcode Number"]).strip()
+    saved = st.session_state["bc_overrides"].get(bkey)
+    auto  = _bc_auto_defaults(row["Item Name"])
+    defs  = dict(saved) if saved else dict(auto)
+    for k, v in auto.items():
+        defs.setdefault(k, v)
+
+    rev  = st.session_state["bc_dialog_rev"]
+    skeys = {k: f"bcov_{k}_{bkey}_{rev}" for k in auto}
+    st.caption(f"**{row['Item Name']}**  •  Barcode: `{bkey or '000000'}`")
+    sc, pc = st.columns([3, 2])
+
+    with sc:
+        st.markdown("##### Size")
+        ns  = st.slider("Item Name Size",       6.0, 14.0, defs["item_name_size"],    0.5,  key=skeys["item_name_size"])
+        ps  = st.slider("Price Size",           5.0, 12.0, defs["price_size"],        0.5,  key=skeys["price_size"])
+        bts = st.slider("Barcode Number Size",  4.0, 10.0, defs["barcode_text_size"], 0.5,  key=skeys["barcode_text_size"])
+        bw  = st.slider("Bar Width (mm)",       0.15, 0.40, defs["bar_width"],        0.01, key=skeys["bar_width"])
+        bh  = st.slider("Bar Height (mm)",      5.0, 12.0, defs["bar_height"],        0.5,  key=skeys["bar_height"])
+        st.markdown("##### Position (mm)")
+        iny = st.slider("Item Name Y",  *_BC_Y_RANGE, defs["item_name_y"],    0.25, key=skeys["item_name_y"])
+        py  = st.slider("Price Y",      *_BC_Y_RANGE, defs["price_y"],        0.25, key=skeys["price_y"])
+        by  = st.slider("Barcode Y",    *_BC_Y_RANGE, defs["barcode_y"],      0.25, key=skeys["barcode_y"])
+        bty = st.slider("Barcode Txt Y",*_BC_Y_RANGE, defs["barcode_text_y"], 0.25, key=skeys["barcode_text_y"])
+        cy  = st.slider("Company Y",    *_BC_Y_RANGE, defs["company_y"],      0.25, key=skeys["company_y"])
+
+    live = {"item_name_size": ns, "price_size": ps, "barcode_text_size": bts,
+            "bar_width": bw, "bar_height": bh,
+            "item_name_y": iny, "price_y": py, "barcode_y": by,
+            "barcode_text_y": bty, "company_y": cy}
+
+    with pc:
+        st.markdown("##### Live Preview")
+        _bc_show_pdf_preview(_bc_generate_pdf(pd.DataFrame([row]), single_preview=True, live_override=live))
+        st.caption("🎨 Custom saved" if bkey in st.session_state["bc_overrides"] else "⚙️ Auto layout")
+
+    st.divider()
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        if st.button("💾 Save", type="primary", use_container_width=True):
+            st.session_state["bc_overrides"][bkey] = live
+            _bc_save_overrides(st.session_state["bc_overrides"])
+            st.toast(f"Saved for {row['Item Name']}")
+            st.rerun()
+    with s2:
+        def _bc_reset(bk=bkey, ks=skeys, ad=auto):
+            st.session_state["bc_overrides"].pop(bk, None)
+            _bc_save_overrides(st.session_state["bc_overrides"])
+            for f, kn in ks.items():
+                st.session_state[kn] = ad[f]
+        st.button("↺ Reset to Auto", use_container_width=True, on_click=_bc_reset)
+    with s3:
+        if st.button("✖️ Close", use_container_width=True):
+            st.rerun()
+
+
+def tab_barcode_generator():
+    st.subheader("🏷️ Barcode Label Generator")
+    st.caption("Upload any CSV, map columns to label fields, generate & download a printable PDF.")
+
+    # ── Init session state ────────────────────────────────────────────────────
+    bc_defaults = {
+        "bc_inventory":   pd.DataFrame(),
+        "bc_uploaded_df": None,
+        "bc_uploaded_name": "",
+        "bc_editor_key":  0,
+        "bc_master_sel":  False,
+        "bc_overrides":   None,
+        "bc_presets":     None,
+        "bc_dialog_rev":  0,
+    }
+    for k, v in bc_defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+    if st.session_state["bc_overrides"] is None:
+        st.session_state["bc_overrides"] = _bc_load_overrides()
+    if st.session_state["bc_presets"] is None:
+        st.session_state["bc_presets"] = _bc_load_presets()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 1+2 — Upload & column mapping
+    # ══════════════════════════════════════════════════════════════════════════
+    if st.session_state["bc_inventory"].empty:
+        uploaded = st.file_uploader("📂 Upload CSV", type=["csv"],
+                                    help="Any CSV — Zoho export, Excel save-as-CSV, etc.")
+        if uploaded is not None:
+            try:
+                st.session_state["bc_uploaded_df"]   = pd.read_csv(uploaded)
+                st.session_state["bc_uploaded_name"] = uploaded.name
+            except Exception as e:
+                st.error(f"Could not read CSV: {e}"); return
+
+        if st.session_state["bc_uploaded_df"] is None:
+            st.info("Upload a CSV to get started — any column layout works.")
+            return
+
+        raw_df   = st.session_state["bc_uploaded_df"]
+        csv_cols = list(raw_df.columns)
+        none_opt = "(none — use default)"
+        col_opts = [none_opt] + csv_cols
+
+        st.subheader("🗂️ Map Columns")
+        st.caption(
+            f"**{st.session_state['bc_uploaded_name']}** — {len(raw_df)} rows, "
+            f"{len(csv_cols)} columns. Pick the CSV column for each label field. "
+            "If a column doesn't exist, leave it as '(none)' and set a default."
+        )
+        with st.expander("👁️ Preview CSV (first 5 rows)", expanded=False):
+            st.dataframe(raw_df.head(5), use_container_width=True)
+
+        st.divider()
+        mapping = {}
+        for (fk, label, default_val, input_type) in _BC_MAPPING_FIELDS:
+            auto = _bc_auto_detect(fk, csv_cols)
+            st.markdown(f"**{label}**")
+            c1, c2 = st.columns([2, 2])
+            with c1:
+                idx = col_opts.index(auto) if auto and auto in col_opts else 0
+                sel = st.selectbox(f"col_{fk}", col_opts, index=idx,
+                                   key=f"bc_map_col_{fk}", label_visibility="collapsed")
+                chosen = None if sel == none_opt else sel
+            with c2:
+                if chosen is None:
+                    if input_type == "number":
+                        dv = st.number_input(f"def_{fk}", min_value=1,
+                                             value=int(default_val), step=1,
+                                             key=f"bc_map_def_{fk}", label_visibility="collapsed")
+                        default_used = str(int(dv))
+                    else:
+                        default_used = st.text_input(f"def_{fk}", value=default_val,
+                                                     key=f"bc_map_def_{fk}",
+                                                     placeholder=f"Default for {label}",
+                                                     label_visibility="collapsed")
+                else:
+                    sample = raw_df[chosen].dropna().astype(str)
+                    st.caption(f"Sample: `{sample.iloc[0] if not sample.empty else '—'}`")
+                    default_used = default_val
+            mapping[fk] = {"col": chosen, "default": default_used}
+
+        st.divider()
+        ca, cb = st.columns([2, 1])
+        with ca:
+            if st.button("✅ Apply Mapping & Generate Labels", type="primary", use_container_width=True):
+                try:
+                    st.session_state["bc_inventory"]  = _bc_apply_mapping(raw_df, mapping)
+                    st.session_state["bc_editor_key"] += 1
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Mapping error: {e}")
+        with cb:
+            if st.button("🔄 Upload Different File", use_container_width=True):
+                st.session_state["bc_uploaded_df"]   = None
+                st.session_state["bc_uploaded_name"] = ""
+                st.rerun()
+        return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 3 — Label editor
+    # ══════════════════════════════════════════════════════════════════════════
+    tb1, tb2, tb3 = st.columns([4, 2, 2])
+    with tb1:
+        if st.session_state["bc_uploaded_name"]:
+            st.caption(f"📄 **{st.session_state['bc_uploaded_name']}**")
+    with tb2:
+        if st.button("⚙️ Layout Presets", use_container_width=True, key="bc_presets_btn"):
+            st.session_state["bc_dialog_rev"] += 1
+            _bc_presets_dialog()
+    with tb3:
+        if st.button("📂 Upload New CSV", use_container_width=True, key="bc_upload_new"):
+            st.session_state["bc_inventory"]    = pd.DataFrame()
+            st.session_state["bc_uploaded_df"]  = None
+            st.session_state["bc_uploaded_name"] = ""
+            st.session_state["bc_editor_key"]   += 1
+            st.rerun()
+
+    st.write("1. Check **Preview** to see a label. 2. Check **Select** + set **Quantity**. 3. Click Generate.")
+
+    master = st.checkbox("☑️ Select / Unselect All", value=st.session_state["bc_master_sel"],
+                         key="bc_master_chk")
+
+    edited = st.data_editor(
+        st.session_state["bc_inventory"],
+        key=f"bc_editor_{st.session_state['bc_editor_key']}",
+        num_rows="dynamic",
+        column_config={
+            "Select":         st.column_config.CheckboxColumn("Print?",     width="small",  default=False),
+            "Preview":        st.column_config.CheckboxColumn("Preview",    width="small",  default=False),
+            "Print Count":    st.column_config.NumberColumn("Qty",          width="small",  min_value=0, step=1, format="%d", default=1),
+            "Item Name":      st.column_config.TextColumn("Item Name",      width="large",  default="New Item"),
+            "Price":          st.column_config.TextColumn("Price",          width="small",  default="Rs.0 / pcs"),
+            "Barcode Number": st.column_config.TextColumn("Barcode Number", width="medium", default=""),
+        },
+        hide_index=True, use_container_width=True, height=380,
+    )
+
+    needs_rerun = False
+    if master != st.session_state["bc_master_sel"]:
+        st.session_state["bc_master_sel"] = master
+        st.session_state["bc_inventory"]  = edited.copy()
+        st.session_state["bc_inventory"]["Select"] = master
+        st.session_state["bc_editor_key"] += 1
+        needs_rerun = True
+
+    ac, _ = st.columns([1, 5])
+    with ac:
+        if st.button("➕ Add Row", key="bc_add_row"):
+            st.session_state["bc_inventory"] = pd.concat(
+                [edited.copy(), pd.DataFrame([{
+                    "Select": False, "Preview": False,
+                    "Item Name": "New Item", "Price": "Rs.0 / pcs",
+                    "Barcode Number": "", "Print Count": 1,
+                }])], ignore_index=True)
+            st.session_state["bc_editor_key"] += 1
+            needs_rerun = True
+
+    # Previews
+    previews = edited[edited["Preview"] == True]
+    if not previews.empty:
+        st.subheader("👁️ Previews")
+        cols = st.columns(3)
+        for i, (idx, row) in enumerate(previews.iterrows()):
+            with cols[i % 3]:
+                h1, h2 = st.columns([5, 1])
+                with h1:
+                    st.caption(f"**{row['Item Name']}**")
+                with h2:
+                    if st.button("❌", key=f"bc_close_{idx}"):
+                        st.session_state["bc_inventory"] = edited.copy()
+                        st.session_state["bc_inventory"].loc[idx, "Preview"] = False
+                        st.session_state["bc_editor_key"] += 1
+                        needs_rerun = True
+                bkey = str(row["Barcode Number"]).strip()
+                saved = st.session_state["bc_overrides"].get(bkey)
+                _bc_show_pdf_preview(_bc_generate_pdf(pd.DataFrame([row]), single_preview=True, live_override=saved))
+                st.caption("🎨 Custom" if saved else "⚙️ Auto")
+                if st.button("🎛️ Customize", key=f"bc_cust_{idx}", use_container_width=True):
+                    st.session_state["bc_dialog_rev"] += 1
+                    _bc_customize_dialog(row)
+
+    if needs_rerun:
+        st.rerun()
+
+    st.divider()
+    if st.button("🖨️ Generate PDF Labels", type="primary", key="bc_gen_pdf"):
+        to_print = edited[(edited["Select"] == True) & (edited["Print Count"] > 0)]
+        if to_print.empty:
+            st.warning("Select at least one item with Qty > 0.")
+        else:
+            with st.spinner("Generating PDF..."):
+                buf = _bc_generate_pdf(to_print, overrides=st.session_state["bc_overrides"])
+                total = to_print["Print Count"].sum()
+            st.success(f"✅ {total} stickers generated!")
+            st.download_button("⬇️ Download Barcodes PDF", data=buf,
+                               file_name="maharani_barcodes.pdf", mime="application/pdf",
+                               key="bc_dl_btn")
+
+
+@st.dialog("⚙️ Barcode Label Layout Presets", width="large")
+def _bc_presets_dialog():
+    p   = st.session_state["bc_presets"]
+    rev = st.session_state["bc_dialog_rev"]
+    st.caption("Items without a saved per-barcode override use one of these presets, chosen by name length.")
+    thr = st.slider("Name-length cutoff", 10, 60, p["threshold"], step=1, key=f"bc_thr_{rev}",
+                    help="Names ≤ this length → Short preset; longer → Long preset.")
+    sc, lc = st.columns(2)
+    with sc:
+        st.markdown("###### Short Names")
+        sv = {f: st.slider(f, *((6.0,14.0) if "size" in f and "bar" not in f else
+                                (5.0,12.0) if f=="price_size" else
+                                (4.0,10.0) if f=="barcode_text_size" else
+                                (0.15,0.40) if f=="bar_width" else
+                                (5.0,12.0) if f=="bar_height" else
+                                _BC_Y_RANGE),
+                           value=p["short"][f],
+                           step=(0.5 if "size" in f or "height" in f else 0.01 if "width" in f else 0.25),
+                           key=f"bc_sp_{f}_{rev}") for f in p["short"]}
+    with lc:
+        st.markdown("###### Long Names")
+        lv = {f: st.slider(f, *((6.0,14.0) if "size" in f and "bar" not in f else
+                                (5.0,12.0) if f=="price_size" else
+                                (4.0,10.0) if f=="barcode_text_size" else
+                                (0.15,0.40) if f=="bar_width" else
+                                (5.0,12.0) if f=="bar_height" else
+                                _BC_Y_RANGE),
+                           value=p["long"][f],
+                           step=(0.5 if "size" in f or "height" in f else 0.01 if "width" in f else 0.25),
+                           key=f"bc_lp_{f}_{rev}") for f in p["long"]}
+
+    st.divider()
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        if st.button("💾 Save Presets", type="primary", use_container_width=True, key=f"bc_save_p_{rev}"):
+            st.session_state["bc_presets"] = {"threshold": thr, "short": sv, "long": lv}
+            _bc_save_presets(st.session_state["bc_presets"])
+            st.toast("Presets saved"); st.rerun()
+    with s2:
+        def _bc_reset_p(r=rev):
+            st.session_state["bc_presets"] = {"threshold": _BC_DEFAULT_THRESHOLD,
+                                               "short": dict(_BC_SHORT_PRESET),
+                                               "long":  dict(_BC_LONG_PRESET)}
+            _bc_save_presets(st.session_state["bc_presets"])
+        st.button("↺ Factory Defaults", use_container_width=True, on_click=_bc_reset_p, key=f"bc_rst_p_{rev}")
+    with s3:
+        if st.button("✖️ Close", use_container_width=True, key=f"bc_cls_p_{rev}"):
+            st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1756,17 +2302,19 @@ def main():
             icon="🔬",
         )
 
-    t1, t2, t3, t4 = st.tabs([
+    t1, t2, t3, t4, t5 = st.tabs([
         "📦 Standard Items",
         "🏗️ Composite Packs",
         "📮 Labels & Shipping",
         "📋 Push Log",
+        "🏷️ Barcode Generator",
     ])
 
     with t1: tab_standard_items(auth_ok=auth_ok, dry_run=dry_run)
     with t2: tab_composite_items(auth_ok=auth_ok, dry_run=dry_run)
     with t3: tab_labels_shipping(auth_ok=auth_ok, dry_run=dry_run)
     with t4: tab_push_log()
+    with t5: tab_barcode_generator()
 
 
 if __name__ == "__main__":
