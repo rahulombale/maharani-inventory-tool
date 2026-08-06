@@ -95,7 +95,7 @@ _LBL_POSITIONS = [
 
 LBL_TABLE_COLS = ["✓", "Date", "Order #", "Name", "Address", "City/State", "Pincode", "Phone", "Amount"]
 
-RATE_DELAY     = 0.7   # seconds between API calls — keeps us safely under 100/min
+RATE_DELAY     = 0.3   # seconds between API calls — HTTP round-trip (~0.3s) + this stays under 100/min
 CALL_WARN      = 70    # warn in sidebar above this many calls
 CALL_HARD_STOP = 90    # refuse further writes until counter is reset
 
