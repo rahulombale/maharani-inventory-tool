@@ -893,7 +893,7 @@ def _bc_show_pdf_preview(buf):
         pix = page.get_pixmap(matrix=fitz.Matrix(5, 5))  # 5x zoom → crisp preview
         img_bytes = pix.tobytes("png")
         doc.close()
-        st.image(img_bytes, use_column_width=True)
+        st.image(img_bytes, use_container_width=True)
     except Exception as e:
         st.warning(f"Preview unavailable: {e}")
 
