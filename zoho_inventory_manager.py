@@ -33,6 +33,7 @@ from datetime import datetime, date, timedelta
 from io import BytesIO
 
 import base64
+import uuid
 import requests
 import pandas as pd
 import streamlit as st
@@ -881,13 +882,25 @@ def _bc_generate_pdf(data, single_preview=False, overrides=None, live_override=N
 
 
 def _bc_show_pdf_preview(buf):
+    """Render a single-page PDF as an inline preview.
+    Uses a JS Blob URL instead of a data: URI — Chrome blocks data: in iframes.
+    """
     b64 = base64.b64encode(buf.read()).decode()
-    st.markdown(
-        f'''<iframe src="data:application/pdf;base64,{b64}#toolbar=0&navpanes=0&scrollbar=0&view=Fit"
-        width="100%" height="150" type="application/pdf"
-        style="border:1px solid #ccc;border-radius:5px;"></iframe>''',
-        unsafe_allow_html=True,
+    uid = uuid.uuid4().hex[:8]
+    html = (
+        "<html><body style='margin:0;padding:0;'>"
+        f"<div id='w{uid}' style='width:100%;height:150px;"
+        "border:1px solid #ccc;border-radius:5px;overflow:hidden;'></div>"
+        "<script>(function(){"
+        f"var b=atob('{b64}'),a=new Uint8Array(b.length);"
+        "for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);"
+        "var u=URL.createObjectURL(new Blob([a],{type:'application/pdf'}));"
+        f"document.getElementById('w{uid}').innerHTML="
+        "'<embed src=\"'+u+'\" type=\"application/pdf\" width=\"100%\" height=\"150\"/>';"
+        "})();</script>"
+        "</body></html>"
     )
+    st.components.v1.html(html, height=155, scrolling=False)
 
 
 def _bc_apply_mapping(raw_df, mapping):
