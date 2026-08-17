@@ -29,6 +29,7 @@ import re
 import time
 import json
 import random
+import zipfile
 from datetime import datetime, date, timedelta
 from io import BytesIO
 
@@ -2317,12 +2318,13 @@ def main():
             icon="🔬",
         )
 
-    t1, t2, t3, t4, t5 = st.tabs([
+    t1, t2, t3, t4, t5, t6 = st.tabs([
         "📦 Standard Items",
         "🏗️ Composite Packs",
         "📮 Labels & Shipping",
         "📋 Push Log",
         "🏷️ Barcode Generator",
+        "🖼️ WebP Converter",
     ])
 
     with t1: tab_standard_items(auth_ok=auth_ok, dry_run=dry_run)
@@ -2330,6 +2332,158 @@ def main():
     with t3: tab_labels_shipping(auth_ok=auth_ok, dry_run=dry_run)
     with t4: tab_push_log()
     with t5: tab_barcode_generator()
+    with t6: tab_webp_converter()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — WEBP CONVERTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tab_webp_converter():
+    """Convert PNG / JPG images to WebP — single image or batch ZIP."""
+    from PIL import Image as _PILImage
+
+    st.header("🖼️ WebP Converter")
+    st.caption(
+        "Convert PNG or JPG images to WebP for faster website loading. "
+        "Single image → download .webp. Multiple images → download ZIP."
+    )
+
+    mode = st.radio(
+        "Conversion mode",
+        ["🖼️ Single Image", "📁 Batch (Multiple Images)"],
+        horizontal=True,
+        key="wc_mode",
+    )
+
+    quality = st.slider(
+        "WebP Quality",
+        min_value=1, max_value=100, value=80,
+        key="wc_quality",
+        help="80 = recommended for product images (great quality, ~60% smaller than PNG).",
+    )
+
+    st.divider()
+
+    # ── SINGLE IMAGE ──────────────────────────────────────────────────────────
+    if mode == "🖼️ Single Image":
+        uploaded = st.file_uploader(
+            "Upload image — drag & drop or browse",
+            type=["png", "jpg", "jpeg"],
+            key="wc_single_upload",
+        )
+
+        if uploaded:
+            col_orig, col_conv = st.columns(2)
+            with col_orig:
+                st.caption(f"**Original:** `{uploaded.name}`  ·  {uploaded.size / 1024:.1f} KB")
+                st.image(uploaded, use_container_width=True)
+
+            if st.button("⚡ Convert to WebP", type="primary", key="wc_single_btn"):
+                try:
+                    img = _PILImage.open(uploaded)
+                    buf = BytesIO()
+                    # Preserve transparency for PNG, otherwise convert to RGB
+                    if img.mode in ("RGBA", "LA"):
+                        img.save(buf, format="WEBP", quality=quality, lossless=False)
+                    else:
+                        img.convert("RGB").save(buf, format="WEBP", quality=quality)
+                    webp_bytes = buf.getvalue()
+
+                    out_name = os.path.splitext(uploaded.name)[0] + ".webp"
+                    saving_pct = (1 - len(webp_bytes) / uploaded.size) * 100
+
+                    with col_conv:
+                        st.caption(
+                            f"**Converted:** `{out_name}`  ·  {len(webp_bytes) / 1024:.1f} KB"
+                        )
+                        st.image(webp_bytes, use_container_width=True)
+
+                    st.success(
+                        f"✅ Done!  Size reduced by **{saving_pct:.1f}%** "
+                        f"({uploaded.size // 1024} KB → {len(webp_bytes) // 1024} KB)"
+                    )
+                    st.download_button(
+                        label=f"⬇️ Download {out_name}",
+                        data=webp_bytes,
+                        file_name=out_name,
+                        mime="image/webp",
+                        type="primary",
+                        key="wc_single_dl",
+                    )
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
+
+    # ── BATCH MODE ────────────────────────────────────────────────────────────
+    else:
+        uploaded_files = st.file_uploader(
+            "Upload images — drag & drop multiple files or browse",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="wc_batch_upload",
+            help="All converted files will be bundled in a ZIP named {folder}_webp.zip",
+        )
+
+        if uploaded_files:
+            total_kb = sum(f.size for f in uploaded_files) / 1024
+            st.caption(
+                f"📁 **{len(uploaded_files)} file(s)** selected  ·  {total_kb:.1f} KB total"
+            )
+
+            folder_name = st.text_input(
+                "Output name (ZIP will be saved as: {name}_webp.zip)",
+                value="images",
+                key="wc_folder_name",
+            )
+
+            with st.expander(f"📋 Files queued for conversion ({len(uploaded_files)})", expanded=True):
+                for f in uploaded_files:
+                    st.write(f"• `{f.name}` — {f.size / 1024:.1f} KB")
+
+            if st.button("⚡ Convert All to WebP", type="primary", key="wc_batch_btn"):
+                try:
+                    zip_buf   = BytesIO()
+                    converted = 0
+                    skipped   = []
+                    progress  = st.progress(0, text="Starting conversion…")
+
+                    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for i, f in enumerate(uploaded_files):
+                            try:
+                                img     = _PILImage.open(f)
+                                img_buf = BytesIO()
+                                if img.mode in ("RGBA", "LA"):
+                                    img.save(img_buf, format="WEBP", quality=quality)
+                                else:
+                                    img.convert("RGB").save(img_buf, format="WEBP", quality=quality)
+                                out_name = os.path.splitext(f.name)[0] + ".webp"
+                                zf.writestr(out_name, img_buf.getvalue())
+                                converted += 1
+                            except Exception as ex:
+                                skipped.append(f"{f.name} ({ex})")
+                            progress.progress(
+                                (i + 1) / len(uploaded_files),
+                                text=f"Converting {i + 1}/{len(uploaded_files)}: {f.name}",
+                            )
+
+                    zip_buf.seek(0)
+                    progress.empty()
+                    zip_name = f"{folder_name}_webp.zip"
+
+                    if skipped:
+                        st.warning(f"Skipped {len(skipped)} file(s): {', '.join(skipped)}")
+                    st.success(f"✅ Converted {converted}/{len(uploaded_files)} images!")
+
+                    st.download_button(
+                        label=f"⬇️ Download {zip_name}",
+                        data=zip_buf.getvalue(),
+                        file_name=zip_name,
+                        mime="application/zip",
+                        type="primary",
+                        key="wc_batch_dl",
+                    )
+                except Exception as e:
+                    st.error(f"Batch conversion failed: {e}")
 
 
 if __name__ == "__main__":
