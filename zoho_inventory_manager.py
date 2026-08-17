@@ -2374,15 +2374,26 @@ def tab_webp_converter():
         )
 
         if uploaded:
+            # Read bytes once — prevents file-pointer exhaustion when PIL opens
+            # the same stream that st.image() already consumed
+            raw_bytes = uploaded.read()
+            orig_size  = len(raw_bytes)
+
+            # Apply EXIF rotation before showing the original preview too
+            _prev_img = _PILImageOps.exif_transpose(_PILImage.open(BytesIO(raw_bytes)))
+            _prev_buf = BytesIO()
+            _prev_fmt = "PNG" if _prev_img.mode in ("RGBA", "LA") else "JPEG"
+            _prev_img.save(_prev_buf, format=_prev_fmt)
+
             col_orig, col_conv = st.columns(2)
             with col_orig:
-                st.caption(f"**Original:** `{uploaded.name}`  ·  {uploaded.size / 1024:.1f} KB")
-                st.image(uploaded, use_container_width=True)
+                st.caption(f"**Original:** `{uploaded.name}`  ·  {orig_size / 1024:.1f} KB")
+                st.image(_prev_buf.getvalue(), use_container_width=True)
 
             if st.button("⚡ Convert to WebP", type="primary", key="wc_single_btn"):
                 try:
-                    img = _PILImage.open(uploaded)
-                    img = _PILImageOps.exif_transpose(img)  # fix phone camera rotation
+                    img = _PILImage.open(BytesIO(raw_bytes))   # fresh BytesIO — no pointer issue
+                    img = _PILImageOps.exif_transpose(img)     # fix phone camera EXIF rotation
                     buf = BytesIO()
                     # Preserve transparency for PNG, otherwise convert to RGB
                     if img.mode in ("RGBA", "LA"):
@@ -2391,8 +2402,8 @@ def tab_webp_converter():
                         img.convert("RGB").save(buf, format="WEBP", quality=quality)
                     webp_bytes = buf.getvalue()
 
-                    out_name = os.path.splitext(uploaded.name)[0] + ".webp"
-                    saving_pct = (1 - len(webp_bytes) / uploaded.size) * 100
+                    out_name    = os.path.splitext(uploaded.name)[0] + ".webp"
+                    saving_pct  = (1 - len(webp_bytes) / orig_size) * 100
 
                     with col_conv:
                         st.caption(
@@ -2402,7 +2413,7 @@ def tab_webp_converter():
 
                     st.success(
                         f"✅ Done!  Size reduced by **{saving_pct:.1f}%** "
-                        f"({uploaded.size // 1024} KB → {len(webp_bytes) // 1024} KB)"
+                        f"({orig_size // 1024} KB → {len(webp_bytes) // 1024} KB)"
                     )
                     st.download_button(
                         label=f"⬇️ Download {out_name}",
@@ -2451,8 +2462,8 @@ def tab_webp_converter():
                     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
                         for i, f in enumerate(uploaded_files):
                             try:
-                                img     = _PILImage.open(f)
-                                img     = _PILImageOps.exif_transpose(img)  # fix phone camera rotation
+                                img     = _PILImage.open(BytesIO(f.read()))  # BytesIO avoids pointer exhaustion
+                                img     = _PILImageOps.exif_transpose(img)   # fix phone camera EXIF rotation
                                 img_buf = BytesIO()
                                 if img.mode in ("RGBA", "LA"):
                                     img.save(img_buf, format="WEBP", quality=quality)
