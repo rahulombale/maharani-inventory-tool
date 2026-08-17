@@ -2341,7 +2341,7 @@ def main():
 
 def tab_webp_converter():
     """Convert PNG / JPG images to WebP — single image or batch ZIP."""
-    from PIL import Image as _PILImage
+    from PIL import Image as _PILImage, ImageOps as _PILImageOps
 
     st.header("🖼️ WebP Converter")
     st.caption(
@@ -2382,6 +2382,7 @@ def tab_webp_converter():
             if st.button("⚡ Convert to WebP", type="primary", key="wc_single_btn"):
                 try:
                     img = _PILImage.open(uploaded)
+                    img = _PILImageOps.exif_transpose(img)  # fix phone camera rotation
                     buf = BytesIO()
                     # Preserve transparency for PNG, otherwise convert to RGB
                     if img.mode in ("RGBA", "LA"):
@@ -2451,6 +2452,7 @@ def tab_webp_converter():
                         for i, f in enumerate(uploaded_files):
                             try:
                                 img     = _PILImage.open(f)
+                                img     = _PILImageOps.exif_transpose(img)  # fix phone camera rotation
                                 img_buf = BytesIO()
                                 if img.mode in ("RGBA", "LA"):
                                     img.save(img_buf, format="WEBP", quality=quality)
