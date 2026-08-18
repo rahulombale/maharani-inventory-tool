@@ -137,6 +137,10 @@ _defaults: dict = {
     "api_call_times":  [],  # sliding window: list of timestamps (float) for last 60s
     "token":           None,
     "token_expiry":    0.0,
+    # ── Create Composite from Existing Zoho Item (czf_ prefix) ──
+    "czf_results":     [],    # cached search results
+    "czf_query":       "",    # last search query shown
+    "czf_selected":    None,  # selected base item dict
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -1490,6 +1494,184 @@ def tab_composite_items(auth_ok: bool, dry_run: bool):
 
             except Exception as exc:
                 st.error(f"Could not read CSV: {exc}")
+
+    st.divider()
+
+    # ── Create Composite from Existing Zoho Item ──────────────────────────────
+    with st.expander("🔗 Create Composite from Existing Zoho Item", expanded=False):
+        if not auth_ok:
+            st.warning("⚠️ Connect Zoho credentials first (sidebar) to use this feature.")
+        else:
+            st.caption(
+                "Search Zoho for an existing base item, then create a composite pack directly. "
+                "**2 API calls** — 1 search + 1 create. Results are cached until you search again."
+            )
+
+            # ── Search ────────────────────────────────────────────────────────
+            sc1, sc2 = st.columns([5, 1])
+            with sc1:
+                czf_query_input = st.text_input(
+                    "Search item name (min 2 chars)",
+                    key="czf_query_input",
+                    placeholder="e.g. moti pearl, kundan, crystal...",
+                )
+            with sc2:
+                st.write("")
+                st.write("")
+                czf_search_btn = st.button(
+                    "🔍 Search",
+                    key="czf_search_btn",
+                    disabled=len(czf_query_input.strip()) < 2,
+                    use_container_width=True,
+                )
+
+            if czf_search_btn and len(czf_query_input.strip()) >= 2:
+                try:
+                    _call_guard()
+                    _tok = get_token()
+                    _resp = requests.get(
+                        f"{API_BASE}/items",
+                        params={
+                            "organization_id": ORG_ID,
+                            "search_text":     czf_query_input.strip(),
+                            "per_page":        25,
+                            "filter_by":       "Status.Active",
+                        },
+                        headers=_hdrs(_tok), timeout=15,
+                    )
+                    _tick()
+                    _data = _resp.json()
+                    _raise_if_auth_error(_data, "GET /items (search)")
+                    st.session_state["czf_results"]  = _data.get("items", [])
+                    st.session_state["czf_query"]    = czf_query_input.strip()
+                    st.session_state["czf_selected"] = None  # reset on new search
+                    if not st.session_state["czf_results"]:
+                        st.info(f"No active items found for '{czf_query_input}'. Try a different search.")
+                except Exception as _e:
+                    st.error(f"Search failed: {_e}")
+
+            # ── Results ───────────────────────────────────────────────────────
+            czf_results = st.session_state["czf_results"]
+            if czf_results:
+                _q = st.session_state["czf_query"]
+                st.caption(
+                    f"🔎 **{len(czf_results)} result(s)** for `{_q}`"
+                    + ("  ·  showing first 25" if len(czf_results) == 25 else "")
+                )
+                _labels = [
+                    f"{r['name']}  ·  SKU: {r.get('sku') or '—'}  ·  ₹{r.get('rate', 0)}"
+                    for r in czf_results
+                ]
+                _sel_idx = st.radio(
+                    "Select base item:",
+                    range(len(czf_results)),
+                    format_func=lambda i: _labels[i],
+                    key="czf_select_radio",
+                )
+                st.session_state["czf_selected"] = czf_results[_sel_idx]
+
+            # ── Composite creation form ────────────────────────────────────────
+            czf_sel = st.session_state["czf_selected"]
+            if czf_sel:
+                st.divider()
+                st.markdown(
+                    f"**Base:** `{czf_sel['name']}`  ·  "
+                    f"SKU: `{czf_sel.get('sku') or '—'}`  ·  "
+                    f"Rate: ₹{czf_sel.get('rate', 0)}"
+                )
+
+                _base_name = czf_sel["name"]
+                _base_sku  = czf_sel.get("sku", "") or ""
+                _base_rate = float(czf_sel.get("rate", 0))
+
+                with st.form("czf_create_form", clear_on_submit=False):
+                    _fc1, _fc2 = st.columns(2)
+                    with _fc1:
+                        _comp_name = st.text_input(
+                            "Composite Item Name",
+                            value=f"{_base_name} pack",
+                        )
+                        _pack_qty = st.number_input(
+                            "Pack Quantity (units of base item)",
+                            min_value=1, value=5, step=1,
+                        )
+                    with _fc2:
+                        _comp_price = st.number_input(
+                            "Selling Price (₹)",
+                            min_value=0.0,
+                            value=round(_base_rate * 5 * 0.9, 0),
+                            step=1.0,
+                        )
+                        _comp_unit = st.text_input("Unit", value="pack size")
+
+                    _comp_sku = st.text_input(
+                        "Composite SKU",
+                        value=(f"{_base_sku}-{5}PK" if _base_sku else str(_gen_sku())),
+                    )
+
+                    _czf_submit = st.form_submit_button(
+                        "⚡ Create Composite in Zoho",
+                        type="primary",
+                    )
+
+                if _czf_submit:
+                    _name_clean = _comp_name.strip()
+                    if not _name_clean:
+                        st.error("Composite name cannot be empty.")
+                    else:
+                        try:
+                            _tok2  = get_token()
+                            _ex_id, _ = find_composite(_tok2, _name_clean)
+                            if _ex_id:
+                                st.warning(
+                                    f"⚠️ **'{_name_clean}'** already exists in Zoho "
+                                    f"(ID: `{_ex_id}`). Rename it or use the overwrite flow above."
+                                )
+                            else:
+                                _payload = {
+                                    "name":          _name_clean,
+                                    "sku":           _comp_sku.strip(),
+                                    "unit":          _comp_unit.strip(),
+                                    "rate":          float(_comp_price),
+                                    "item_type":     "sales",
+                                    "combo_type":    "kit",
+                                    "mapped_items": [
+                                        {
+                                            "item_id":  czf_sel["item_id"],
+                                            "quantity": float(_pack_qty),
+                                        }
+                                    ],
+                                }
+                                if dry_run:
+                                    st.info(
+                                        f"🔬 Dry Run — would POST /compositeitems: "
+                                        f"**'{_name_clean}'** ({_pack_qty}× `{_base_name}` @ ₹{_comp_price})"
+                                    )
+                                    _log(_name_clean, "CREATE", "🔬 Dry Run", "",
+                                         "Would POST /compositeitems")
+                                else:
+                                    _resp2 = create_composite(_tok2, _payload)
+                                    if _resp2.get("code") == 0:
+                                        _new_id = _resp2.get("composite_item", {}).get(
+                                            "composite_item_id", "")
+                                        st.success(
+                                            f"✅ **'{_name_clean}'** created!  "
+                                            f"ID: `{_new_id}`  ·  "
+                                            f"{_pack_qty}× `{_base_name}` @ ₹{_comp_price}"
+                                        )
+                                        _log(_name_clean, "CREATE", "✅ Created", _new_id,
+                                             f"{_pack_qty}× {_base_name} @ ₹{_comp_price}")
+                                        # Clear selection so user can create another
+                                        st.session_state["czf_selected"] = None
+                                        st.rerun()
+                                    else:
+                                        st.error(
+                                            f"❌ Create failed: {_resp2.get('message', _resp2)}"
+                                        )
+                                        _log(_name_clean, "CREATE", "❌ Error", "",
+                                             str(_resp2.get("message", _resp2)))
+                        except Exception as _ce:
+                            st.error(f"Error: {_ce}")
 
     st.divider()
     # ── Source for base items (used by the generator form below) ─────────────
